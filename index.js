@@ -7,164 +7,125 @@ const { plugin: collectBlock } = require('mineflayer-collectblock');
 
 // =================== BOT CONFIGURATION ===================
 const BOT_CONFIG = {
-  // --- Server and Login ---
   host: 'nl-01.freezehost.pro',
   port: 10380,
   username: 'lian_0_0',
-  master: 'lian_0_0', // <-- IMPORTANT: Change this to your Minecraft username
+  master: 'lian_0_0',
   auth: 'offline',
-
-  // --- Version and Mining ---
   version: '1.20.1',
-  AUTO_MINING_ON_START: true,
   BLOCK_TO_MINE: 'diamond_ore',
   EXPLORE_DISTANCE: 64
 };
 // =========================================================
 
-// --- Keep-Alive Server (for Replit 24/7 Hosting) ---
+// --- WEB SERVER FOR HOSTING PLATFORM (THE PORT IS THE FIX) ---
 const app = express();
+const port = process.env.PORT || 3000; // Use port provided by Railway, or 3000 as a fallback.
 app.all('/', (req, res) => res.send('Bot is running.'));
-app.listen(3000, () => console.log('Keep-alive server is ready.'));
+app.listen(port, () => console.log(`[System] Health-check server listening on port ${port}.`));
 
-// --- Main Bot Logic ---
+// --- GLOBAL CRASH HANDLER (PREVENTS THE WHOLE APP FROM STOPPING) ---
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[FATAL] Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// --- MAIN BOT LOGIC ---
 let bot;
-let isAutoMining = false;
+let isMining = false;
 
 function createBot() {
-  console.log(`Attempting to connect to ${BOT_CONFIG.host}:${BOT_CONFIG.port} with version ${BOT_CONFIG.version}...`);
+  console.log(`[System] Connecting to ${BOT_CONFIG.host}:${BOT_CONFIG.port}...`);
+  bot = mineflayer.createBot(BOT_CONFIG);
 
-  bot = mineflayer.createBot({
-    host: BOT_CONFIG.host,
-    port: BOT_CONFIG.port,
-    username: BOT_CONFIG.username,
-    version: BOT_CONFIG.version,
-    auth: BOT_CONFIG.auth
-  });
-
-  // --- LOAD PLUGINS ---
   bot.loadPlugin(pathfinder);
   bot.loadPlugin(collectBlock);
 
-  // --- EVENT HANDLERS ---
-  bot.on('login', () => {
-    console.log(`SUCCESS! Bot '${bot.username}' has logged in. Waiting to spawn...`);
-  });
+  bot.on('login', () => console.log(`[System] Logged in as '${bot.username}'. Waiting for spawn...`));
   
-  // *** THIS IS THE FIX ***
-  // We wait for the 'spawn' event to ensure the bot is fully in the world.
   bot.on('spawn', () => {
-    console.log("Bot has spawned in the world.");
-    
-    // Configure pathfinder movements once spawned
+    console.log("[System] Spawned. Initializing miner.");
     const mcData = require('minecraft-data')(bot.version);
-    const moves = new Movements(bot, mcData);
-    bot.pathfinder.setMovements(moves);
-    
-    bot.chat("Bot online. Ready for commands.");
-    if (BOT_CONFIG.AUTO_MINING_ON_START) {
-      // No need for a timeout anymore, we can start immediately.
-      startAutoMiningLoop('Auto-start on spawn');
-    }
+    bot.pathfinder.setMovements(new Movements(bot, mcData));
+    bot.chat("Bot online.");
+    startMining();
   });
-
 
   bot.on('chat', (username, message) => {
     if (username !== BOT_CONFIG.master) return;
-
-    const args = message.split(' ');
-    const command = args[0];
-
-    if (command === 'stop') stopAutoMiner(true);
-    if (command === 'start') startAutoMiningLoop('Command');
-    if (command === 'find') {
-      if (args[1]) {
-        BOT_CONFIG.BLOCK_TO_MINE = args[1];
-        bot.chat(`Now set to find: ${BOT_CONFIG.BLOCK_TO_MINE}`);
-        if(isAutoMining) {
-           stopAutoMiner(false);
-           startAutoMiningLoop('Target changed');
-        }
-      } else {
-        bot.chat('Usage: find <block_name>');
-      }
+    const [command, arg] = message.split(' ');
+    if (command === 'find' && arg) {
+      BOT_CONFIG.BLOCK_TO_MINE = arg;
+      bot.chat(`Target set to: ${arg}. Restarting miner.`);
+      stopMining();
+      startMining();
     }
+    if (command === 'stop') stopMining(true);
+    if (command === 'start') startMining();
   });
   
-  // --- ROBUST RECONNECT LOGIC ---
   const handleDisconnect = (reason) => {
-    console.log(`Disconnected. Reason: ${reason}`);
-    stopAutoMiner(false);
-    console.log('Reconnecting in 30 seconds...');
+    console.log(`[System] Disconnected. Reason: ${reason}.`);
+    stopMining();
+    console.log('[System] Reconnecting in 30 seconds...');
     setTimeout(createBot, 30000);
   };
 
   bot.on('kicked', handleDisconnect);
   bot.on('end', handleDisconnect);
-  bot.on('error', (err) => {
-    console.error(`An error occurred: ${err.message}`);
-  });
+  bot.on('error', (err) => console.error(`[Bot Error] An error occurred: ${err.message}`));
 }
 
-// --- Auto-Miner Functions (No changes needed here) ---
-function stopAutoMiner(showInChat) {
-  if (!isAutoMining || !bot.entity) return; // Add a check for bot.entity
-  isAutoMining = false;
-  bot.pathfinder.stop();
-  bot.collectBlock.stop();
-  if (showInChat) {
-    bot.chat('Auto-miner paused.');
-  }
-  console.log('Auto-miner paused.');
+// --- Auto-Miner Functions ---
+function stopMining(chat = false) {
+  if (!isMining) return;
+  isMining = false;
+  // Check if plugins are loaded before trying to stop them
+  if (bot && bot.pathfinder) bot.pathfinder.stop();
+  if (bot && bot.collectBlock) bot.collectBlock.stop();
+  if (chat) bot.chat('Mining stopped.');
+  console.log('[Miner] Stopped.');
 }
 
-async function startAutoMiningLoop(reason) {
-  if (isAutoMining) { bot.chat('Auto-miner is already running.'); return; }
-  
-  isAutoMining = true;
-  console.log(`Auto-miner started. Reason: ${reason}`);
-  bot.chat(`Starting continuous hunt for ${BOT_CONFIG.BLOCK_TO_MINE}.`);
+async function startMining() {
+  if (isMining) return;
+  isMining = true;
+  console.log(`[Miner] Started. Hunting for ${BOT_CONFIG.BLOCK_TO_MINE}.`);
+  bot.chat(`Hunting for ${BOT_CONFIG.BLOCK_TO_MINE}.`);
 
-  const mcData = require('minecraft-data')(bot.version);
-  
-  while (isAutoMining) {
+  while (isMining) {
     try {
-      await performOneMiningCycle(mcData);
+      await performOneMiningCycle();
     } catch (err) {
-      console.error(`Error in mining cycle: ${err.message}. Restarting loop.`);
-      await new Promise(resolve => setTimeout(resolve, 5000));
+      console.error(`[Miner Error] Cycle failed: ${err.message}. Recovering...`);
+      await new Promise(r => setTimeout(r, 5000)); // Wait 5 seconds on any error
     }
-    if (!isAutoMining) break;
   }
 }
 
-async function performOneMiningCycle(mcData) {
+async function performOneMiningCycle() {
+  const mcData = require('minecraft-data')(bot.version);
   const blockType = mcData.blocksByName[BOT_CONFIG.BLOCK_TO_MINE];
   if (!blockType) {
-    bot.chat(`Error: Block '${BOT_CONFIG.BLOCK_TO_MINE}' not found in this version.`);
-    stopAutoMiner(false);
+    console.error(`[Config Error] Block '${BOT_CONFIG.BLOCK_TO_MINE}' is invalid for version ${bot.version}.`);
+    bot.chat(`Invalid block: ${BOT_CONFIG.BLOCK_TO_MINE}. Stopping.`);
+    stopMining();
     return;
   }
   
-  // Use bot.findBlock instead of findBlocks for simplicity with collectBlock
-  const targetBlock = bot.findBlock({
-    matching: blockType.id,
-    maxDistance: 128
-  });
+  const targetBlock = await bot.findBlock({ matching: blockType.id, maxDistance: 128 });
 
   if (targetBlock) {
-    bot.chat(`Found ${BOT_CONFIG.BLOCK_TO_MINE}. Tunneling...`);
+    console.log(`[Miner] Found ${BOT_CONFIG.BLOCK_TO_MINE} at ${targetBlock.position}. Collecting...`);
     await bot.collectBlock.collect(targetBlock);
-    bot.chat('Collection cycle complete. Rescanning...');
+    console.log('[Miner] Collection complete. Rescanning.');
   } else {
-    bot.chat('No ores found nearby. Exploring to a new area...');
+    console.log('[Miner] No ores found. Exploring to a new area...');
     const { x, z } = bot.entity.position;
     const angle = Math.random() * Math.PI * 2;
     const goalX = x + Math.cos(angle) * BOT_CONFIG.EXPLORE_DISTANCE;
     const goalZ = z + Math.sin(angle) * BOT_CONFIG.EXPLORE_DISTANCE;
-    
     await bot.pathfinder.goto(new GoalXZ(goalX, goalZ));
-    bot.chat('Exploration move complete. Rescanning for ores.');
+    console.log('[Miner] Exploration complete.');
   }
 }
 
